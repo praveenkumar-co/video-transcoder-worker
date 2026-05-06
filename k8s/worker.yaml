@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: transcoder-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: "/metrics"
+        prometheus.io/port: "9091"
+    spec: 
+      initContainers:
+        - name: wait-for-redis
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z redis 6379; do
+                echo "Waiting for Redis...";
+                sleep 2;
+              done;
+              echo "Redis is up!"
+      containers:
+        - name: worker
+          image: video-worker
+          imagePullPolicy: Never
+          resources:
+            limits:
+              memory: "1536Mi"
+              cpu: "1200m"
+            requests:
+              memory: "512Mi"
+              cpu: "300m"
+          envFrom:
+            - configMapRef:
+                name: vp-config
+            - secretRef:
+                name: vp-secrets
+          ports:
+            - name: metrics
+              containerPort: 9091
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: transcoder-worker
+spec:
+  type: ClusterIP
+  selector:
+    app: worker
+  ports:
+    - name: metrics
+      port: 9091
+      targetPort: 9091
