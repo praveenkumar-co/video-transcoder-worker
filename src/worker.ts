@@ -8,10 +8,15 @@ import mongoose from 'mongoose';
 import dotenv from 'dotenv';
 dotenv.config();
 import { VideoJob } from './types';
-import { downloadFromS3, uploadDirectoryToS3 } from './s3.service';
+import { downloadFromS3, uploadDirectoryToS3, uploadFileToS3 } from './s3.service';
 import { transcode } from './transcoder';
 import { onProgress, clearProgress } from './progress';
 import { jobsCompleted, jobsFailed, jobDuration, activeJobs } from './metrics';
+import { compress } from './processors/compress';
+import { convert } from './processors/convert';
+import { extractAudio } from './processors/extract-audio';
+import { trim } from './processors/trim';
+import { downloadFromUrl } from './processors/download-url';
 
 interface VideoDoc {
   _id: string;
@@ -45,7 +50,23 @@ async function markFailed(videoId: string, reason: string) {
     { $set: { status: 'failed', updatedAt: new Date() } }
   );
   console.error(`[${videoId}] DB updated — status: failed. Reason: ${reason}`);
-} 
+}
+
+async function markCompletedWithOutput(videoId: string, outputUrl: string) {
+  await videosCollection().updateOne(
+    { _id: videoId },
+    { $set: { status: 'completed', outputUrl, updatedAt: new Date() } }
+  );
+  console.info(`[${videoId}] DB updated — outputUrl: ${outputUrl}`);
+}
+
+function buildOutputUrl(s3Key: string): string {
+  const bucket = process.env.S3_PROCESSED_BUCKET!;
+  const region = process.env.AWS_REGION || 'us-east-1';
+  return process.env.CLOUDFRONT_DOMAIN
+    ? `https://${process.env.CLOUDFRONT_DOMAIN}/${s3Key}`
+    : `https://${bucket}.s3.${region}.amazonaws.com/${s3Key}`;
+}
 if (!process.env.REDIS_HOST) {
   throw new Error("REDIS_HOST missing");
 }
@@ -64,74 +85,180 @@ const worker = new Worker<VideoJob>(
     await connectMongo();
 
     console.log('[worker] Initialising job...');
-    const { videoId, s3Key, bucket } = job.data;
-    console.log(`[worker] Picked job:`, job.data);
-    const tmpDir = path.join(os.tmpdir(), `transcode-${videoId}`);
+    const { videoId, s3Key, bucket, jobType = 'transcode' } = job.data;
+    console.log(`[worker] Picked job: type=${jobType}`, job.data);
+
+    const tmpDir = path.join(os.tmpdir(), `job-${videoId}`);
     const inputPath = path.join(tmpDir, 'input.mp4');
     const outputDir = path.join(tmpDir, 'out');
-    console.log(`[worker] Temp dir: ${tmpDir}`);
+
     activeJobs.inc();
     const endTimer = jobDuration.startTimer();
+
     try {
       await fs.mkdir(tmpDir, { recursive: true });
+
+      // download-url skips S3 download — gets file from internet directly
+      if (jobType === 'download-url') {
+        console.info(`[${videoId}] Downloading from URL...`);
+        await job.updateProgress(10);
+        const { downloadedPath } = await downloadFromUrl({
+          videoId,
+          sourceUrl: job.data.sourceUrl!,
+          outputDir: tmpDir,
+        });
+
+        // After download, run HLS transcode on it
+        console.info(`[${videoId}] Starting transcode on downloaded file...`);
+        await job.updateProgress(30);
+        onProgress(videoId, (p) => job.updateProgress(30 + Math.floor(p.percentage * 0.5)));
+
+        const result = await transcode({ videoId, inputPath: downloadedPath, outputDir });
+        clearProgress(videoId);
+
+        await job.updateProgress(90);
+        const processedBucket = process.env.S3_PROCESSED_BUCKET!;
+        const s3OutputPrefix = `processed/${videoId}`;
+        await uploadDirectoryToS3(outputDir, processedBucket, s3OutputPrefix);
+
+        await job.updateProgress(100);
+        const playbackOrigin = process.env.CLOUDFRONT_DOMAIN
+          ? `https://${process.env.CLOUDFRONT_DOMAIN}`
+          : `https://${processedBucket}.s3.${process.env.AWS_REGION}.amazonaws.com`;
+        const masterPlaylistUrl = `${playbackOrigin}/${s3OutputPrefix}/master.m3u8`;
+        await markCompleted(videoId, masterPlaylistUrl);
+        jobsCompleted.inc();
+        endTimer();
+        return { videoId, masterPlaylistUrl, resolutions: result.resolutions };
+      }
+
+      // All other job types — first download from S3
       console.info(`[${videoId}] Downloading from S3...`);
       await job.updateProgress(5);
       await downloadFromS3(bucket, s3Key, inputPath);
-
-      console.info(`[${videoId}] Starting FFmpeg...`);
       await job.updateProgress(10);
 
-      onProgress(videoId, (progress) => {
-        job.updateProgress(10 + Math.floor(progress.percentage * 0.8));
-      });
+      switch (jobType) {
 
-      const result = await transcode({ videoId, inputPath, outputDir });
+        case 'transcode': {
+          onProgress(videoId, (p) => job.updateProgress(10 + Math.floor(p.percentage * 0.8)));
+          const result = await transcode({
+            videoId,
+            inputPath,
+            outputDir,
+            resolution: job.data.resolution,
+          });
+          clearProgress(videoId);
+          await job.updateProgress(90);
 
-      clearProgress(videoId);
+          const processedBucket = process.env.S3_PROCESSED_BUCKET!;
+          const s3OutputPrefix = `processed/${videoId}`;
+          await uploadDirectoryToS3(outputDir, processedBucket, s3OutputPrefix);
+          await job.updateProgress(100);
 
-      console.info(`[${videoId}] Uploading HLS output...`);
-      await job.updateProgress(90);
+          const playbackOrigin = process.env.CLOUDFRONT_DOMAIN
+            ? `https://${process.env.CLOUDFRONT_DOMAIN}`
+            : `https://${processedBucket}.s3.${process.env.AWS_REGION}.amazonaws.com`;
+          const masterPlaylistUrl = `${playbackOrigin}/${s3OutputPrefix}/master.m3u8`;
+          await markCompleted(videoId, masterPlaylistUrl);
+          jobsCompleted.inc();
+          endTimer();
+          return { videoId, masterPlaylistUrl, resolutions: result.resolutions };
+        }
 
-      const processedBucket = process.env.S3_PROCESSED_BUCKET!;
-      const s3OutputPrefix = `processed/${videoId}`;
+        case 'compress': {
+          const result = await compress({
+            videoId,
+            inputPath,
+            outputDir,
+            targetSizeMB: job.data.targetSizeMB!,
+          });
+          await job.updateProgress(90);
+          const s3Key_out = `processed/${videoId}/compressed.mp4`;
+          await uploadFileToS3(result.outputPath, process.env.S3_PROCESSED_BUCKET!, s3Key_out);
+          await job.updateProgress(100);
+          const outputUrl = buildOutputUrl(s3Key_out);
+          await markCompletedWithOutput(videoId, outputUrl);
+          jobsCompleted.inc();
+          endTimer();
+          return { videoId, outputUrl };
+        }
 
-      await uploadDirectoryToS3(outputDir, processedBucket, s3OutputPrefix);
+        case 'convert': {
+          const result = await convert({
+            videoId,
+            inputPath,
+            outputDir,
+            outputFormat: job.data.outputFormat!,
+          });
+          await job.updateProgress(90);
+          const s3Key_out = `processed/${videoId}/converted.${job.data.outputFormat}`;
+          await uploadFileToS3(result.outputPath, process.env.S3_PROCESSED_BUCKET!, s3Key_out);
+          await job.updateProgress(100);
+          const outputUrl = buildOutputUrl(s3Key_out);
+          await markCompletedWithOutput(videoId, outputUrl);
+          jobsCompleted.inc();
+          endTimer();
+          return { videoId, outputUrl };
+        }
 
-      await job.updateProgress(100);
-      const region = process.env.AWS_REGION || 'us-east-1';
-      const playbackOrigin = process.env.CLOUDFRONT_DOMAIN
-        ? `https://${process.env.CLOUDFRONT_DOMAIN}`
-        : `https://${processedBucket}.s3.${region}.amazonaws.com`;
-      const masterPlaylistUrl = `${playbackOrigin}/${s3OutputPrefix}/master.m3u8`;
-      await markCompleted(videoId, masterPlaylistUrl);
-      jobsCompleted.inc();
-      endTimer();
-      console.info(`[${videoId}] Done. Resolutions: ${result.resolutions.join(', ')}`);
-      return {
-        videoId,
-        masterPlaylistUrl,
-        resolutions: result.resolutions,
-        masterPlaylist: result.masterPlaylistPath,
-      };
+        case 'extract-audio': {
+          const result = await extractAudio({
+            videoId,
+            inputPath,
+            outputDir,
+            audioFormat: job.data.audioFormat!,
+          });
+          await job.updateProgress(90);
+          const s3Key_out = `processed/${videoId}/audio.${job.data.audioFormat}`;
+          await uploadFileToS3(result.outputPath, process.env.S3_PROCESSED_BUCKET!, s3Key_out);
+          await job.updateProgress(100);
+          const outputUrl = buildOutputUrl(s3Key_out);
+          await markCompletedWithOutput(videoId, outputUrl);
+          jobsCompleted.inc();
+          endTimer();
+          return { videoId, outputUrl };
+        }
+
+        case 'trim': {
+          const result = await trim({
+            videoId,
+            inputPath,
+            outputDir,
+            startTime: job.data.startTime!,
+            endTime: job.data.endTime!,
+          });
+          await job.updateProgress(90);
+          const s3Key_out = `processed/${videoId}/trimmed.mp4`;
+          await uploadFileToS3(result.outputPath, process.env.S3_PROCESSED_BUCKET!, s3Key_out);
+          await job.updateProgress(100);
+          const outputUrl = buildOutputUrl(s3Key_out);
+          await markCompletedWithOutput(videoId, outputUrl);
+          jobsCompleted.inc();
+          endTimer();
+          return { videoId, outputUrl };
+        }
+
+        default:
+          throw new Error(`Unknown jobType: ${jobType}`);
+      }
+
     } catch (err: any) {
       jobsFailed.inc();
       endTimer();
-      const attemptsAllowed = job.opts.attempts ?? 1;
-      const isFinalAttempt = job.attemptsMade + 1 >= attemptsAllowed;
-
+      const isFinalAttempt = job.attemptsMade + 1 >= (job.opts.attempts ?? 1);
       if (isFinalAttempt) {
-        await markFailed(videoId, err?.message ?? 'unknown error');
+        await markFailed(videoId, err?.message ?? 'unknown');
+        console.error(`[${videoId}] Job permanently failed:`, err);
       } else {
-        console.warn(
-          `[${videoId}] Attempt ${job.attemptsMade + 1}/${attemptsAllowed} failed; BullMQ will retry. Reason: ${err?.message ?? 'unknown error'}`
-        );
+        console.warn(`[${videoId}] Attempt ${job.attemptsMade + 1} failed, retrying... Error:`, err);
       }
       throw err;
     } finally {
       clearProgress(videoId);
       activeJobs.dec();
       await fs.rm(tmpDir, { recursive: true, force: true });
-      console.info(`[${videoId}] Tmp cleaned up`);
+      console.info(`[${videoId}] Tmp cleaned`);
     }
   },
   {
@@ -158,7 +285,7 @@ async function shutdown(signal: string): Promise<void> {
   await worker.close();
   await mongoose.disconnect();
   process.exit(0);
-} 
+}
 
 process.on('SIGTERM', () => void shutdown('SIGTERM'));
 process.on('SIGINT', () => void shutdown('SIGINT'));

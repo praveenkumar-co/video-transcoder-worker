@@ -1,6 +1,6 @@
 FROM node:20-alpine
 
-RUN apk add --no-cache ffmpeg ca-certificates && update-ca-certificates
+RUN apk add --no-cache ffmpeg ca-certificates yt-dlp && update-ca-certificates
 
 WORKDIR /app
 

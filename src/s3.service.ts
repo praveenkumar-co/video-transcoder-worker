@@ -11,6 +11,7 @@ import * as path from 'path';
 import dotenv from 'dotenv';
 dotenv.config();
 import { NodeHttpHandler } from '@smithy/node-http-handler';
+import { Agent as HttpsAgent } from 'https';
 
 if (!process.env.REDIS_HOST) {
   throw new Error("REDIS_HOST missing");
@@ -23,6 +24,10 @@ const s3Client = new S3Client({
   },
   maxAttempts: 3,
   requestHandler: new NodeHttpHandler({
+    httpsAgent: new HttpsAgent({
+      keepAlive: true,
+      family: 4,
+    }),
     requestTimeout: 300000, 
     connectionTimeout: 10000, 
   }),
@@ -143,8 +148,36 @@ async function getAllFiles(dir: string): Promise<string[]> {
   return files;
 }
 
+export async function uploadFileToS3(
+  localPath: string,
+  bucket: string,
+  s3Key: string
+): Promise<void> {
+  console.info(`[uploadFileToS3] Uploading ${localPath} → s3://${bucket}/${s3Key}`);
+  const contentType = getContentType(localPath);
+  const upload = new Upload({
+    client: s3Client,
+    params: {
+      Bucket: bucket,
+      Key: s3Key,
+      Body: createReadStream(localPath),
+      ContentType: contentType,
+    },
+  });
+  await upload.done();
+  console.info(`[uploadFileToS3] Done: ${s3Key}`);
+}
+
 function getContentType(filePath: string): string {
   if (filePath.endsWith('.m3u8')) return 'application/vnd.apple.mpegurl';
-  if (filePath.endsWith('.ts')) return 'video/mp2t';
+  if (filePath.endsWith('.ts'))   return 'video/mp2t';
+  if (filePath.endsWith('.mp4'))  return 'video/mp4';
+  if (filePath.endsWith('.webm')) return 'video/webm';
+  if (filePath.endsWith('.mov'))  return 'video/quicktime';
+  if (filePath.endsWith('.avi'))  return 'video/x-msvideo';
+  if (filePath.endsWith('.mkv'))  return 'video/x-matroska';
+  if (filePath.endsWith('.mp3'))  return 'audio/mpeg';
+  if (filePath.endsWith('.wav'))  return 'audio/wav';
+  if (filePath.endsWith('.aac'))  return 'audio/aac';
   return 'application/octet-stream';
 }

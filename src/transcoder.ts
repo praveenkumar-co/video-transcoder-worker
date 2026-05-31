@@ -6,8 +6,8 @@ import ffmpeg from 'fluent-ffmpeg';
 import { emitProgress } from './progress';
 import dotenv from 'dotenv';
 dotenv.config();
-const FFMPEG_PATH  = process.env.FFMPEG_PATH  || '/usr/bin/ffmpeg';
-const FFPROBE_PATH = process.env.FFPROBE_PATH || '/usr/bin/ffprobe';
+const FFMPEG_PATH  = process.env.FFMPEG_PATH  || 'ffmpeg';
+const FFPROBE_PATH = process.env.FFPROBE_PATH || 'ffprobe';
 const FFMPEG_THREADS = Math.max(
   1,
   Math.min(Number(process.env.FFMPEG_THREADS ?? 2), os.cpus().length)
@@ -29,6 +29,7 @@ export interface TranscodeOptions {
   videoId: string;
   inputPath: string;
   outputDir: string;
+  resolution?: string;
 }
 
 export interface TranscodeResult {
@@ -46,9 +47,12 @@ interface Resolution {
 }
 
 const RESOLUTION_LADDER: Resolution[] = [
-  { name: '1080p', width: 1920, height: 1080, videoBitrate: '5000k', audioBitrate: '192k' },
-  { name: '720p',  width: 1280, height: 720,  videoBitrate: '2800k', audioBitrate: '128k' },
-  { name: '360p',  width: 640,  height: 360,  videoBitrate: '800k',  audioBitrate: '96k'  },
+  { name: '4K',   width: 3840, height: 2160, videoBitrate: '15000k', audioBitrate: '192k' },
+  { name: '1080p', width: 1920, height: 1080, videoBitrate: '5000k',  audioBitrate: '192k' },
+  { name: '720p',  width: 1280, height: 720,  videoBitrate: '2800k',  audioBitrate: '128k' },
+  { name: '480p',  width: 854,  height: 480,  videoBitrate: '1400k',  audioBitrate: '128k' },
+  { name: '360p',  width: 640,  height: 360,  videoBitrate: '800k',   audioBitrate: '96k'  },
+  { name: '240p',  width: 426,  height: 240,  videoBitrate: '400k',   audioBitrate: '64k'  },
 ];
 
 interface VideoProbeResult { duration: number; width: number; height: number; hasAudio: boolean; }
@@ -119,10 +123,17 @@ export async function transcode(options: TranscodeOptions): Promise<TranscodeRes
 
   const { duration: totalDuration, width, height, hasAudio } = await probeVideo(inputPath);
 
-  let targetResolutions = RESOLUTION_LADDER.filter((r) => r.height <= height);
+ let targetResolutions: Resolution[];
+
+if (options.resolution) {
+  const picked = RESOLUTION_LADDER.find((r) => r.name === options.resolution);
+  targetResolutions = picked ? [picked] : [RESOLUTION_LADDER[1]]; 
+} else { 
+  targetResolutions = RESOLUTION_LADDER.filter((r) => r.height <= height);
   if (targetResolutions.length === 0) {
     targetResolutions = [RESOLUTION_LADDER[RESOLUTION_LADDER.length - 1]];
   }
+}
 
   console.info(
     `Transcoding ${videoId}: ${width}x${height} → ${targetResolutions.map((r) => r.name).join(', ')}`
