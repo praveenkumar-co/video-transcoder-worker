@@ -3,6 +3,7 @@ import {
   S3Client,
   GetObjectCommand,
   HeadObjectCommand,
+  PutObjectCommand,
 } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
 import { createReadStream } from 'fs';
@@ -27,6 +28,7 @@ const s3Client = new S3Client({
     httpsAgent: new HttpsAgent({
       keepAlive: true,
       family: 4,
+      maxSockets: 100,
     }),
     requestTimeout: 300000, 
     connectionTimeout: 10000, 
@@ -89,37 +91,71 @@ export async function uploadDirectoryToS3(
 ): Promise<void> {
   console.info(`[uploadDirectoryToS3] Scanning directory: ${localDir}`);
   const files = await getAllFiles(localDir);
-  console.info(`[uploadDirectoryToS3] Found ${files.length} file(s) to upload — uploading in parallel`);
+  console.info(`[uploadDirectoryToS3] Found ${files.length} file(s) to upload — uploading with high speed`);
 
-  const CONCURRENCY = Math.max(
+  const concurrency = Math.max(
     1,
-    Math.min(Number(process.env.S3_UPLOAD_CONCURRENCY ?? 4), 8)
+    Math.min(Number(process.env.S3_UPLOAD_CONCURRENCY ?? 30), 100)
   );
-  for (let i = 0; i < files.length; i += CONCURRENCY) {
-    const batch = files.slice(i, i + CONCURRENCY);
-    await Promise.all(
-      batch.map(async (filePath) => {
-        const relativePath = path.relative(localDir, filePath);
-        const s3Key = `${s3Prefix}/${relativePath}`.replace(/\\/g, '/');
-        const contentType = getContentType(filePath);
-        const upload = new Upload({
-          client: s3Client,
-          params: {
+  console.info(`[uploadDirectoryToS3] Using concurrency: ${concurrency}`);
+
+  let uploadedCount = 0;
+  const tasks = files.map((filePath) => {
+    return async () => {
+      const relativePath = path.relative(localDir, filePath);
+      const s3Key = `${s3Prefix}/${relativePath}`.replace(/\\/g, '/');
+      const contentType = getContentType(filePath);
+      const cacheControl = filePath.endsWith('.ts')
+        ? 'max-age=31536000'
+        : 'max-age=0, no-cache';
+
+      try {
+        const stat = await fs.stat(filePath);
+        if (stat.size < 5 * 1024 * 1024) {
+          const fileBuffer = await fs.readFile(filePath);
+          await s3Client.send(new PutObjectCommand({
             Bucket: bucket,
             Key: s3Key,
-            Body: createReadStream(filePath),
+            Body: fileBuffer,
             ContentType: contentType,
-            CacheControl: filePath.endsWith('.ts')
-              ? 'max-age=31536000'
-              : 'max-age=0, no-cache',
-          },
-        });
-        await upload.done();
-        console.info(`[uploadDirectoryToS3] Uploaded: ${s3Key}`);
-      })
-    );
-    console.info(`[uploadDirectoryToS3] Batch ${Math.floor(i / CONCURRENCY) + 1} done (${Math.min(i + CONCURRENCY, files.length)}/${files.length})`);
-  }
+            CacheControl: cacheControl,
+          }));
+        } else {
+          const upload = new Upload({
+            client: s3Client,
+            params: {
+              Bucket: bucket,
+              Key: s3Key,
+              Body: createReadStream(filePath),
+              ContentType: contentType,
+              CacheControl: cacheControl,
+            },
+          });
+          await upload.done();
+        }
+
+        uploadedCount++;
+        if (uploadedCount % 20 === 0 || uploadedCount === files.length) {
+          console.info(`[uploadDirectoryToS3] Progress: ${uploadedCount}/${files.length} files uploaded (${Math.round((uploadedCount / files.length) * 100)}%)`);
+        }
+      } catch (err) {
+        console.error(`[uploadDirectoryToS3] Failed to upload ${s3Key}:`, err);
+        throw err;
+      }
+    };
+  });
+
+  const workers = Array.from({ length: concurrency }, async () => {
+    while (tasks.length > 0) {
+      const task = tasks.shift();
+      if (task) {
+        await task();
+      }
+    }
+  });
+
+  await Promise.all(workers);
+  console.info(`[uploadDirectoryToS3] All ${files.length} files successfully uploaded!`);
 }
  
 export async function getVideoDurationFromS3(

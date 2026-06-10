@@ -1,8 +1,24 @@
-import { spawn } from 'child_process';
+import { spawn, spawnSync } from 'child_process';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 
 const YTDLP_PATH = process.env.YTDLP_PATH || 'yt-dlp';
+
+export function getUrlTitle(sourceUrl: string): string {
+  try {
+    const result = spawnSync(YTDLP_PATH, ['--get-title', '--no-playlist', sourceUrl], {
+      encoding: 'utf-8',
+      timeout: 10000,
+    });
+    if (result.status === 0 && result.stdout) {
+      return result.stdout.trim();
+    }
+  } catch (err) {
+    console.warn(`[getUrlTitle] Failed to fetch title using yt-dlp:`, err);
+  }
+  return '';
+}
+
 
 function runYtDlp(args: string[]): Promise<void> {
   return new Promise((resolve, reject) => {

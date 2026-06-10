@@ -16,13 +16,15 @@ import { compress } from './processors/compress';
 import { convert } from './processors/convert';
 import { extractAudio } from './processors/extract-audio';
 import { trim } from './processors/trim';
-import { downloadFromUrl } from './processors/download-url';
+import { downloadFromUrl, getUrlTitle } from './processors/download-url';
 
 interface VideoDoc {
   _id: string;
   status: string;
   masterPlaylistUrl?: string;
   updatedAt?: Date;
+  originalName?: string;
+  sizeBytes?: number;
 }
 
 function videosCollection() {
@@ -100,13 +102,32 @@ const worker = new Worker<VideoJob>(
 
       // download-url skips S3 download — gets file from internet directly
       if (jobType === 'download-url') {
+        const sourceUrl = job.data.sourceUrl!;
+        console.info(`[${videoId}] Fetching YouTube title for ${sourceUrl}...`);
+        const title = getUrlTitle(sourceUrl);
+        if (title) {
+          console.info(`[${videoId}] Updating originalName to "${title}"`);
+          await videosCollection().updateOne(
+            { _id: videoId },
+            { $set: { originalName: title } }
+          );
+        }
+
         console.info(`[${videoId}] Downloading from URL...`);
         await job.updateProgress(10);
         const { downloadedPath } = await downloadFromUrl({
           videoId,
-          sourceUrl: job.data.sourceUrl!,
+          sourceUrl,
           outputDir: tmpDir,
         });
+
+        // After download completes, get size and update DB
+        const stats = await fs.stat(downloadedPath);
+        console.info(`[${videoId}] Updating sizeBytes to ${stats.size}`);
+        await videosCollection().updateOne(
+          { _id: videoId },
+          { $set: { sizeBytes: stats.size } }
+        );
 
         // After download, run HLS transcode on it
         console.info(`[${videoId}] Starting transcode on downloaded file...`);
@@ -172,7 +193,13 @@ const worker = new Worker<VideoJob>(
             inputPath,
             outputDir,
             targetSizeMB: job.data.targetSizeMB!,
+            // forward the caller's mode preference; defaults to FAST inside compress()
+            compressionMode: job.data.compressionMode,
+            upscale: job.data.upscale,
           });
+          if (result.skipped) {
+            console.info(`[${videoId}] Compression skipped (file too small) — uploading source copy`);
+          }
           await job.updateProgress(90);
           const s3Key_out = `processed/${videoId}/compressed.mp4`;
           await uploadFileToS3(result.outputPath, process.env.S3_PROCESSED_BUCKET!, s3Key_out);
@@ -181,7 +208,7 @@ const worker = new Worker<VideoJob>(
           await markCompletedWithOutput(videoId, outputUrl);
           jobsCompleted.inc();
           endTimer();
-          return { videoId, outputUrl };
+          return { videoId, outputUrl, mode: result.mode, skipped: result.skipped };
         }
 
         case 'convert': {

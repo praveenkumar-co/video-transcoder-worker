@@ -53,7 +53,8 @@ kind: Service
 metadata:
   name: transcoder-worker
 spec:
-  type: ClusterIP
+  type: ClusterIP. # nodePort can be used for external Connection 
+  # The selector in the Service matches the labels in the Deployment to link them together.
   selector:
     app: worker
   ports:

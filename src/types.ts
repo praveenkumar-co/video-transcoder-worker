@@ -12,7 +12,7 @@ export interface VideoJob {
   bucket: string;
   jobType: JobType;
 
-  resolution?: '4K' | '1080p' | '720p' | '480p' | '360p' | '240p';
+  resolution?: '1080p' | '720p' | '480p' | '360p';
 
   targetSizeMB?: number;
 
@@ -24,6 +24,11 @@ export interface VideoJob {
   endTime?: number;
 
   sourceUrl?: string;
+
+  /** 'FAST' = h264_videotoolbox single-pass (Apple Silicon default).
+   *  'HIGH_QUALITY' = libx264 2-pass, better bit-accuracy. Defaults to 'FAST'. */
+  compressionMode?: 'FAST' | 'HIGH_QUALITY';
+  upscale?: boolean;
 }
 
 export interface TranscodeProgress {
