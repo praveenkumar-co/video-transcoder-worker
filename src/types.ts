@@ -24,9 +24,6 @@ export interface VideoJob {
   endTime?: number;
 
   sourceUrl?: string;
-
-  /** 'FAST' = h264_videotoolbox single-pass (Apple Silicon default).
-   *  'HIGH_QUALITY' = libx264 2-pass, better bit-accuracy. Defaults to 'FAST'. */
   compressionMode?: 'FAST' | 'HIGH_QUALITY';
   upscale?: boolean;
 }
