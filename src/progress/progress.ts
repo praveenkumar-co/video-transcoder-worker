@@ -1,6 +1,6 @@
 
 
-import { TranscodeProgress } from './types';
+import { TranscodeProgress } from '../types/types';
 
 // a progress callback function that keep on track of every user progress
 

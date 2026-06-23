@@ -1,7 +1,7 @@
 import { spawn } from 'child_process';
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { supportsVideoToolbox } from '../transcoder';
+import { supportsVideoToolbox } from '../transcoder/transcoder';
 
 const FFMPEG_PATH  = process.env.FFMPEG_PATH  || 'ffmpeg';
 const FFPROBE_PATH = process.env.FFPROBE_PATH || 'ffprobe';

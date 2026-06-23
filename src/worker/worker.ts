@@ -1,5 +1,5 @@
 import http from "http";
-import { registry } from "./metrics";
+import { registry } from "../progress/metrics";
 import { Worker, Job } from "bullmq";
 import * as fs from "fs/promises";
 import * as path from "path";
@@ -7,20 +7,20 @@ import * as os from "os";
 import mongoose from "mongoose";
 import dotenv from "dotenv";
 dotenv.config();
-import { VideoJob } from "./types";
+import { VideoJob } from "../types/types";
 import {
   downloadFromS3,
   uploadDirectoryToS3,
   uploadFileToS3,
-} from "./s3.service";
-import { transcode } from "./transcoder";
-import { onProgress, clearProgress } from "./progress";
-import { jobsCompleted, jobsFailed, jobDuration, activeJobs } from "./metrics";
-import { compress } from "./processors/compress";
-import { convert } from "./processors/convert";
-import { extractAudio } from "./processors/extract-audio";
-import { trim } from "./processors/trim";
-import { downloadFromUrl, getUrlTitle } from "./processors/download-url";
+} from "../s3-service/s3.service";
+import { transcode } from "../transcoder/transcoder";
+import { onProgress, clearProgress } from "../progress/progress";
+import { jobsCompleted, jobsFailed, jobDuration, activeJobs } from "../progress/metrics";
+import { compress } from "../processors/compress";
+import { convert } from "../processors/convert";
+import { extractAudio } from "../processors/extract-audio";
+import { trim } from "../processors/trim";
+import { downloadFromUrl, getUrlTitle } from "../processors/download-url";
 
 interface VideoDoc {
   _id: string;

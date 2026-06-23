@@ -3,7 +3,7 @@ import * as path from "path";
 import { execSync, spawn } from "child_process";
 import * as os from "os";
 import ffmpeg from "fluent-ffmpeg";
-import { emitProgress } from "./progress";
+import { emitProgress } from "../progress/progress";
 import dotenv from "dotenv";
 dotenv.config();
 
