@@ -76,7 +76,7 @@ export async function downloadFromUrl(options: DownloadUrlOptions): Promise<Down
 
   const durationMs = Date.now() - jobStart;
   console.info(`[download-url] Done in ${(durationMs / 1000).toFixed(1)}s`);
-
+  
   return {
     downloadedPath: outputTemplate,
     durationMs,

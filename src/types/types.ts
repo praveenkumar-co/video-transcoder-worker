@@ -4,7 +4,8 @@ export type JobType =
   | 'convert'
   | 'extract-audio'
   | 'trim'
-  | 'download-url';
+  | 'download-url'
+  | 'thumbnail';
 
 export interface VideoJob {
   videoId: string;

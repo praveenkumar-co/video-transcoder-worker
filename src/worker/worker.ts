@@ -13,7 +13,7 @@ import {
   uploadDirectoryToS3,
   uploadFileToS3,
 } from "../s3-service/s3.service";
-import { transcode } from "../transcoder/transcoder";
+import { transcode, generateThumbnailFile, getVideoDuration } from "../transcoder/transcoder";
 import { onProgress, clearProgress } from "../progress/progress";
 import { jobsCompleted, jobsFailed, jobDuration, activeJobs } from "../progress/metrics";
 import { compress } from "../processors/compress";
@@ -68,6 +68,42 @@ function buildOutputUrl(s3Key: string): string {
   return process.env.CLOUDFRONT_DOMAIN
     ? `https://${process.env.CLOUDFRONT_DOMAIN}/${s3Key}`
     : `https://${bucket}.s3.${region}.amazonaws.com/${s3Key}`;
+}
+async function tryGenerateAndUploadThumbnail(videoId: string, inputPath: string, timestampSeconds?: number) {
+  try {
+    const tmpThumbnailPath = path.join(os.tmpdir(), `thumbnail-${videoId}.jpg`);
+    let ss = timestampSeconds !== undefined ? timestampSeconds : 2;
+    if (timestampSeconds === undefined) {
+      try {
+        const duration = await getVideoDuration(inputPath);
+        if (duration > 0) {
+          ss = Math.min(2, duration * 0.1);
+        }
+      } catch {}
+    }
+    
+    await generateThumbnailFile(inputPath, tmpThumbnailPath, ss);
+    
+    const processedBucket = process.env.S3_PROCESSED_BUCKET!;
+    const s3Key = `processed/${videoId}/thumbnail.jpg`;
+    await uploadFileToS3(tmpThumbnailPath, processedBucket, s3Key);
+    
+    const playbackOrigin = process.env.CLOUDFRONT_DOMAIN
+      ? `https://${process.env.CLOUDFRONT_DOMAIN}`
+      : `https://${processedBucket}.s3.${process.env.AWS_REGION}.amazonaws.com`;
+    const thumbnailUrl = `${playbackOrigin}/${s3Key}`;
+    
+    await videosCollection().updateOne(
+      { _id: videoId },
+      { $set: { thumbnailUrl } }
+    );
+    console.info(`[${videoId}] Thumbnail generated and uploaded: ${thumbnailUrl}`);
+    await fs.rm(tmpThumbnailPath, { force: true });
+    return thumbnailUrl;
+  } catch (err) {
+    console.warn(`[${videoId}] Failed to generate/upload thumbnail:`, err);
+    return null;
+  }
 }
 if (!process.env.REDIS_HOST) {
   throw new Error("REDIS_HOST missing");
@@ -155,6 +191,7 @@ const worker = new Worker<VideoJob>(
         const processedBucket = process.env.S3_PROCESSED_BUCKET!;
         const s3OutputPrefix = `processed/${videoId}`;
         await uploadDirectoryToS3(outputDir, processedBucket, s3OutputPrefix);
+        await tryGenerateAndUploadThumbnail(videoId, downloadedPath);
         await job.updateProgress(100);
         const playbackOrigin = process.env.CLOUDFRONT_DOMAIN
           ? `https://${process.env.CLOUDFRONT_DOMAIN}`
@@ -185,6 +222,7 @@ const worker = new Worker<VideoJob>(
           const processedBucket = process.env.S3_PROCESSED_BUCKET!;
           const s3OutputPrefix = `processed/${videoId}`;
           await uploadDirectoryToS3(outputDir, processedBucket, s3OutputPrefix);
+          await tryGenerateAndUploadThumbnail(videoId, inputPath);
           await job.updateProgress(100);
           const playbackOrigin = process.env.CLOUDFRONT_DOMAIN
             ? `https://${process.env.CLOUDFRONT_DOMAIN}`
@@ -220,6 +258,7 @@ const worker = new Worker<VideoJob>(
             process.env.S3_PROCESSED_BUCKET!,
             s3Key_out,
           );
+          await tryGenerateAndUploadThumbnail(videoId, inputPath);
           await job.updateProgress(100);
           const outputUrl = buildOutputUrl(s3Key_out);
           await markCompletedWithOutput(videoId, outputUrl);
@@ -246,6 +285,7 @@ const worker = new Worker<VideoJob>(
             process.env.S3_PROCESSED_BUCKET!,
             s3Key_out,
           );
+          await tryGenerateAndUploadThumbnail(videoId, inputPath);
           await job.updateProgress(100);
           const outputUrl = buildOutputUrl(s3Key_out);
           await markCompletedWithOutput(videoId, outputUrl);
@@ -289,12 +329,29 @@ const worker = new Worker<VideoJob>(
             process.env.S3_PROCESSED_BUCKET!,
             s3Key_out,
           );
+          await tryGenerateAndUploadThumbnail(videoId, inputPath);
           await job.updateProgress(100);
           const outputUrl = buildOutputUrl(s3Key_out);
           await markCompletedWithOutput(videoId, outputUrl);
           jobsCompleted.inc();
           endTimer();
           return { videoId, outputUrl };
+        }
+        case "thumbnail": {
+          await job.updateProgress(20);
+          const thumbnailUrl = await tryGenerateAndUploadThumbnail(videoId, inputPath, job.data.startTime);
+          await job.updateProgress(100);
+          if (thumbnailUrl) {
+            await videosCollection().updateOne(
+              { _id: videoId },
+              { $set: { status: "completed", outputUrl: thumbnailUrl, updatedAt: new Date() } },
+            );
+            jobsCompleted.inc();
+            endTimer();
+            return { videoId, thumbnailUrl };
+          } else {
+            throw new Error("Failed to generate thumbnail");
+          }
         }
         default:
           throw new Error(`Unknown jobType: ${jobType}`);

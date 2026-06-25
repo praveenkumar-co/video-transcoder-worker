@@ -359,3 +359,40 @@ export async function transcode(
     durationMs,
   };
 }
+
+export function generateThumbnailFile(
+  inputPath: string,
+  outputPath: string,
+  timestampSeconds = 2
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const args = [
+      "-y",
+      "-ss",
+      timestampSeconds.toString(),
+      "-i",
+      inputPath,
+      "-vframes",
+      "1",
+      "-q:v",
+      "2",
+      "-vf",
+      "scale=320:180:force_original_aspect_ratio=decrease,pad=320:180:(ow-iw)/2:(oh-ih)/2",
+      outputPath,
+    ];
+    console.info(`[thumbnail] running: ${FFMPEG_PATH} ${args.join(" ")}`);
+    const proc = spawn(FFMPEG_PATH, args, { stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    proc.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+    proc.on("close", (code) => {
+      if (code === 0) resolve();
+      else {
+        const tail = stderr.split("\n").slice(-10).join("\n");
+        reject(new Error(`FFmpeg thumbnail exited with code ${code}: ${tail}`));
+      }
+    });
+    proc.on("error", reject);
+  });
+}
