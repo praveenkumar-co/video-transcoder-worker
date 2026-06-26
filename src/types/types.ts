@@ -27,6 +27,7 @@ export interface VideoJob {
   sourceUrl?: string;
   compressionMode?: 'FAST' | 'HIGH_QUALITY';
   upscale?: boolean;
+  targetJobType?: string;
 }
 
 export interface TranscodeProgress {

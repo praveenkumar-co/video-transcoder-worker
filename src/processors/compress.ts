@@ -86,9 +86,9 @@ export async function compress(options: CompressOptions): Promise<CompressResult
 
   const outputPath    = path.join(outputDir, `${videoId}_compressed.mp4`);
   const originalSizeMB = await getFileSizeMB(inputPath);
-  if (originalSizeMB < SKIP_COMPRESSION_BELOW_MB) {
+  if (originalSizeMB <= targetSizeMB) {
     console.info(
-      `[compress] ${videoId}: ${originalSizeMB.toFixed(1)} MB < ${SKIP_COMPRESSION_BELOW_MB} MB threshold — ` +
+      `[compress] ${videoId}: ${originalSizeMB.toFixed(1)} MB <= ${targetSizeMB} MB target — ` +
       `skipping compression, copying source file.`
     );
     await fs.copyFile(inputPath, outputPath);
@@ -132,14 +132,13 @@ export async function compress(options: CompressOptions): Promise<CompressResult
     ffmpegArgs.push('-vf', 'scale=3840:2160:flags=lanczos');
   }
   ffmpegArgs.push(
-    '-c:v', supportsVideoToolbox ? 'h264_videotoolbox' : 'libx264',
+    '-c:v', 'libx264',
+    '-preset', 'veryfast',
     '-b:v', `${videoBitrateKbps}k`,
     '-maxrate', `${videoBitrateKbps}k`,
+    '-bufsize', `${videoBitrateKbps * 2}k`,
     '-pix_fmt', 'yuv420p'
   );
-  if (!supportsVideoToolbox) {
-    ffmpegArgs.push('-preset', 'veryfast');
-  }
   ffmpegArgs.push(
     '-c:a', 'aac',
     '-b:a', `${audioBitrateKbps}k`,
@@ -152,6 +151,20 @@ export async function compress(options: CompressOptions): Promise<CompressResult
   );
   const compressedSizeMB = await getFileSizeMB(outputPath);
   console.info(`[compress] Done [FAST]: ${compressedSizeMB.toFixed(1)} MB`);
+
+  if (compressedSizeMB >= originalSizeMB) {
+    console.warn(`[compress] Compressed size (${compressedSizeMB.toFixed(1)} MB) >= original size (${originalSizeMB.toFixed(1)} MB). Fallback to copying original file.`);
+    await fs.copyFile(inputPath, outputPath);
+    return {
+      outputPath,
+      originalSizeMB,
+      compressedSizeMB: originalSizeMB,
+      durationMs: Date.now() - jobStart,
+      skipped: true,
+      mode: 'FAST',
+    };
+  }
+
   return {
     outputPath,
     originalSizeMB,

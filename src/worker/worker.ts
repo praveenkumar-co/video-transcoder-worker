@@ -26,6 +26,7 @@ interface VideoDoc {
   _id: string;
   status: string;
   masterPlaylistUrl?: string;
+  resolutions?: string[];
   updatedAt?: Date;
   originalName?: string;
   sizeBytes?: number;
@@ -39,13 +40,17 @@ async function connectMongo() {
     console.info("[worker] MongoDB connected");
   }
 }
-async function markCompleted(videoId: string, masterPlaylistUrl: string) {
+async function markCompleted(videoId: string, masterPlaylistUrl: string, resolutions?: string[]) {
+  const update: any = { status: "completed", masterPlaylistUrl, updatedAt: new Date() };
+  if (resolutions) {
+    update.resolutions = resolutions;
+  }
   await videosCollection().updateOne(
     { _id: videoId },
-    { $set: { status: "completed", masterPlaylistUrl, updatedAt: new Date() } },
+    { $set: update },
   );
   console.info(
-    `[${videoId}] DB updated — status: completed, masterPlaylistUrl set`,
+    `[${videoId}] DB updated — status: completed, masterPlaylistUrl set, resolutions: ${resolutions}`,
   );
 }
 async function markFailed(videoId: string, reason: string) {
@@ -55,12 +60,19 @@ async function markFailed(videoId: string, reason: string) {
   );
   console.error(`[${videoId}] DB updated — status: failed. Reason: ${reason}`);
 }
-async function markCompletedWithOutput(videoId: string, outputUrl: string) {
+async function markCompletedWithOutput(videoId: string, outputUrl: string, sizeBytes?: number) {
+  const updateDoc: any = { status: "completed", outputUrl, updatedAt: new Date() };
+  if (sizeBytes !== undefined && sizeBytes > 0) {
+    updateDoc.sizeBytes = sizeBytes;
+  }
   await videosCollection().updateOne(
     { _id: videoId },
-    { $set: { status: "completed", outputUrl, updatedAt: new Date() } },
+    { 
+      $set: updateDoc,
+      $unset: { masterPlaylistUrl: "", resolutions: "" }
+    },
   );
-  console.info(`[${videoId}] DB updated — outputUrl: ${outputUrl}`);
+  console.info(`[${videoId}] DB updated — outputUrl: ${outputUrl}${sizeBytes ? `, sizeBytes: ${sizeBytes}` : ""}`);
 }
 function buildOutputUrl(s3Key: string): string {
   const bucket = process.env.S3_PROCESSED_BUCKET!;
@@ -176,6 +188,32 @@ const worker = new Worker<VideoJob>(
             err,
           );
         }
+        const targetJobType = job.data.targetJobType;
+        if (targetJobType === "compress") {
+          console.info(`[${videoId}] Starting compression on downloaded file...`);
+          await job.updateProgress(30);
+          const result = await compress({
+            videoId,
+            inputPath: downloadedPath,
+            outputDir,
+            targetSizeMB: job.data.targetSizeMB!,
+          });
+          await job.updateProgress(90);
+          const s3Key_out = `processed/${videoId}/compressed.mp4`;
+          await uploadFileToS3(
+            result.outputPath,
+            process.env.S3_PROCESSED_BUCKET!,
+            s3Key_out,
+          );
+          await job.updateProgress(100);
+          const outputUrl = buildOutputUrl(s3Key_out);
+          const sizeBytes = await fs.stat(result.outputPath).then(s => s.size).catch(() => 0);
+          await markCompletedWithOutput(videoId, outputUrl, sizeBytes);
+          jobsCompleted.inc();
+          endTimer();
+          return { videoId, outputUrl };
+        }
+
         console.info(`[${videoId}] Starting transcode on downloaded file...`);
         await job.updateProgress(30);
         onProgress(videoId, (p) =>
@@ -191,13 +229,12 @@ const worker = new Worker<VideoJob>(
         const processedBucket = process.env.S3_PROCESSED_BUCKET!;
         const s3OutputPrefix = `processed/${videoId}`;
         await uploadDirectoryToS3(outputDir, processedBucket, s3OutputPrefix);
-        await tryGenerateAndUploadThumbnail(videoId, downloadedPath);
         await job.updateProgress(100);
         const playbackOrigin = process.env.CLOUDFRONT_DOMAIN
           ? `https://${process.env.CLOUDFRONT_DOMAIN}`
           : `https://${processedBucket}.s3.${process.env.AWS_REGION}.amazonaws.com`;
         const masterPlaylistUrl = `${playbackOrigin}/${s3OutputPrefix}/master.m3u8`;
-        await markCompleted(videoId, masterPlaylistUrl);
+        await markCompleted(videoId, masterPlaylistUrl, result.resolutions);
         jobsCompleted.inc();
         endTimer();
         return { videoId, masterPlaylistUrl, resolutions: result.resolutions };
@@ -222,13 +259,12 @@ const worker = new Worker<VideoJob>(
           const processedBucket = process.env.S3_PROCESSED_BUCKET!;
           const s3OutputPrefix = `processed/${videoId}`;
           await uploadDirectoryToS3(outputDir, processedBucket, s3OutputPrefix);
-          await tryGenerateAndUploadThumbnail(videoId, inputPath);
           await job.updateProgress(100);
           const playbackOrigin = process.env.CLOUDFRONT_DOMAIN
             ? `https://${process.env.CLOUDFRONT_DOMAIN}`
             : `https://${processedBucket}.s3.${process.env.AWS_REGION}.amazonaws.com`;
           const masterPlaylistUrl = `${playbackOrigin}/${s3OutputPrefix}/master.m3u8`;
-          await markCompleted(videoId, masterPlaylistUrl);
+          await markCompleted(videoId, masterPlaylistUrl, result.resolutions);
           jobsCompleted.inc();
           endTimer();
           return {
@@ -258,10 +294,10 @@ const worker = new Worker<VideoJob>(
             process.env.S3_PROCESSED_BUCKET!,
             s3Key_out,
           );
-          await tryGenerateAndUploadThumbnail(videoId, inputPath);
           await job.updateProgress(100);
           const outputUrl = buildOutputUrl(s3Key_out);
-          await markCompletedWithOutput(videoId, outputUrl);
+          const sizeBytes = await fs.stat(result.outputPath).then(s => s.size).catch(() => 0);
+          await markCompletedWithOutput(videoId, outputUrl, sizeBytes);
           jobsCompleted.inc();
           endTimer();
           return {
@@ -285,10 +321,10 @@ const worker = new Worker<VideoJob>(
             process.env.S3_PROCESSED_BUCKET!,
             s3Key_out,
           );
-          await tryGenerateAndUploadThumbnail(videoId, inputPath);
           await job.updateProgress(100);
           const outputUrl = buildOutputUrl(s3Key_out);
-          await markCompletedWithOutput(videoId, outputUrl);
+          const sizeBytes = await fs.stat(result.outputPath).then(s => s.size).catch(() => 0);
+          await markCompletedWithOutput(videoId, outputUrl, sizeBytes);
           jobsCompleted.inc();
           endTimer();
           return { videoId, outputUrl };
@@ -309,7 +345,8 @@ const worker = new Worker<VideoJob>(
           );
           await job.updateProgress(100);
           const outputUrl = buildOutputUrl(s3Key_out);
-          await markCompletedWithOutput(videoId, outputUrl);
+          const sizeBytes = await fs.stat(result.outputPath).then(s => s.size).catch(() => 0);
+          await markCompletedWithOutput(videoId, outputUrl, sizeBytes);
           jobsCompleted.inc();
           endTimer();
           return { videoId, outputUrl };
@@ -329,16 +366,21 @@ const worker = new Worker<VideoJob>(
             process.env.S3_PROCESSED_BUCKET!,
             s3Key_out,
           );
-          await tryGenerateAndUploadThumbnail(videoId, inputPath);
           await job.updateProgress(100);
           const outputUrl = buildOutputUrl(s3Key_out);
-          await markCompletedWithOutput(videoId, outputUrl);
+          const sizeBytes = await fs.stat(result.outputPath).then(s => s.size).catch(() => 0);
+          await markCompletedWithOutput(videoId, outputUrl, sizeBytes);
           jobsCompleted.inc();
           endTimer();
           return { videoId, outputUrl };
         }
         case "thumbnail": {
-          await job.updateProgress(20);
+          await job.updateProgress(10);
+          const duration = await getVideoDuration(inputPath);
+          if (job.data.startTime !== undefined && job.data.startTime > duration) {
+            throw new Error(`Requested timestamp ${job.data.startTime}s exceeds video duration of ${duration.toFixed(1)}s`);
+          }
+          await job.updateProgress(30);
           const thumbnailUrl = await tryGenerateAndUploadThumbnail(videoId, inputPath, job.data.startTime);
           await job.updateProgress(100);
           if (thumbnailUrl) {
